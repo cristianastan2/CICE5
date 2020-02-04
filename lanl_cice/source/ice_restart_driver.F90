@@ -194,7 +194,9 @@
       use ice_communicate, only: my_task, master_task
       use ice_constants, only: c0, p5, &
           field_loc_center, field_loc_NEcorner, &
-          field_type_scalar, field_type_vector
+          field_type_scalar, field_type_vector, &
+          c1, rhoi, rhos, Lfresh, cp_ice,cp_ocn,& ! Added by C.Stan
+          Tsmelt,Tffresh
       use ice_domain, only: nblocks, distrb_info, halo_info
       use ice_domain_size, only: nilyr, nslyr, ncat, nx_global, ny_global, &
           max_ntrcr, max_blocks
@@ -217,11 +219,14 @@
       use ice_itd, only: cleanup_itd, kitd
       use ice_state, only: ntrcr, nbtrcr, tr_aero, tr_pond_topo
       use ice_zbgc_shared, only: flux_bio, first_ice
-      use ice_therm_shared, only: heat_capacity
+      use ice_therm_shared, only: heat_capacity, ktherm ! ktherm added by C.Stan
+      use ice_therm_mushy, only:  enthalpy_mush ! Added by C.Stan
+
 
       use ice_flux, only: fresh, frain, fpond, frzmlt, frazil, frz_onset, &
           update_ocn_f, fsalt, Tf, salinz, fhocn, faero_ocn, rside, &
-          meltl
+          meltl, &
+          Tmltz, Tair ! Added by C.Stan
 
       use ice_blocks, only: block, get_block
       use ice_domain, only: nblocks, blocks_ice
@@ -245,7 +250,15 @@
 
       integer (kind=int_kind) :: &
          i, j, k, n, iblk, &     ! counting indices
-         iignore                 ! dummy variable
+         iignore, &              ! dummy variable
+         ij, &          ! horizontal index, combines i and j loops; Added by C.Stan          
+         icells         ! number of cells initialized with ice; Added by C.Stan      
+
+      integer (kind=int_kind), dimension(nx_block*ny_block) :: &
+         indxi, indxj    ! compressed indices for cells with aicen > puny; Added by C.Stan
+
+       real (kind=dbl_kind) :: &
+         slope,Ti       ! Added by C.Stan
 
       real (kind=real_kind) :: &
          rignore                 ! dummy variable
@@ -263,6 +276,11 @@
          work_g1, work_g2
 
       character (len=3) :: nchar
+ 
+! Added by C.Stan
+      indxi(:) = 0
+      indxj(:) = 0
+
 
       call init_restart_read(ice_ic)
 
@@ -563,6 +581,120 @@
          npt = npt - istep0
       endif
 
+! Added by C.Stan to fix the out of bounds errors due to interpolated ICs
+
+      if (trim(runtype) == 'initial') then
+
+      !$OMP PARALLEL DO PRIVATE(iblk)
+      do iblk = 1, nblocks
+      this_block = get_block(blocks_ice(iblk),iblk)
+
+               ! ice enthalpy, salinity
+               do k = 1, nilyr
+                  do ij = 1, icells
+                     i = indxi(ij)
+                     j = indxj(ij)
+
+                     ! assume linear temp profile and compute enthalpy
+                     slope = Tf(i,j,iblk) - trcrn(i,j,nt_Tsfc,n,iblk)
+                     Ti = trcrn(i,j,nt_Tsfc,n,iblk) &
+                        + slope*(real(k,kind=dbl_kind)-p5) &
+                                /real(nilyr,kind=dbl_kind)
+
+                     if (ktherm == 2) then
+                        ! enthalpy
+                        trcrn(i,j,nt_qice+k-1,n,iblk) = &
+                             enthalpy_mush(Ti, salinz(i,j,k,iblk))
+                     else
+                        trcrn(i,j,nt_qice+k-1,n,iblk) = &
+                            -(rhoi * (cp_ice*(Tmltz(i,j,k,iblk)-Ti) &
+                            + Lfresh*(c1-Tmltz(i,j,k,iblk)/Ti) - cp_ocn*Tmltz(i,j,k,iblk)))
+                     endif
+                     ! salinity
+                     trcrn(i,j,nt_sice+k-1,n,iblk) = salinz(i,j,k,iblk)
+                  enddo            ! ij
+               enddo               ! nilyr
+
+               ! snow enthalpy
+               do k = 1, nslyr
+                  do ij = 1, icells
+                     i = indxi(ij)
+                     j = indxj(ij)
+                     Ti = min(c0, trcrn(i,j,nt_Tsfc,n,iblk))
+                     trcrn(i,j,nt_qsno+k-1,n,iblk) = -rhos*(Lfresh - cp_ice*Ti)
+
+                  enddo            ! ij
+               enddo               ! nslyr
+       do j = 1, ny_block
+         do i = 1, nx_block
+
+            if (tmask(i,j,iblk)) then ! compute only on ocean
+
+               do n = 1, ncat
+
+                  ! --- snow layers
+                  Ti = min(c0,trcrn(i,j,nt_Tsfc,n,iblk)) ! check temp not > 0
+                  do k=1,nslyr
+                     if (heat_capacity) then
+                        trcrn(i,j,nt_qsno+k-1,n,iblk) =  -rhos * (Lfresh - cp_ice*Ti)
+                     else
+                        trcrn(i,j,nt_qsno+k-1,n,iblk) =  -rhos * Lfresh
+                     endif ! if heat_capacity
+                  enddo !k
+
+                  ! --- ice layers
+                  do k=1,nilyr  ! ice layers
+                     trcrn(i,j,nt_sice+k-1,n,iblk) = salinz(i,j,k,iblk) ! salinity
+
+                     ! assume linear temp profile and compute enthalpy
+                     slope = Tf(i,j,iblk) - trcrn(i,j,nt_Tsfc,n,iblk)
+                     Ti = min(c0,trcrn(i,j,nt_Tsfc,n,iblk)) ! check temp not > 0
+                     Ti = Ti & !trcrn(i,j,nt_Tsfc,n,iblk) &
+                          + slope*(real(k,kind=dbl_kind)-p5) &
+                          /real(nilyr,kind=dbl_kind)
+
+                     if (ktherm == 2) then  ! mushy
+                        ! enthalpy
+                       trcrn(i,j,nt_qice+k-1,n,iblk) = &
+                             enthalpy_mush(Ti, salinz(i,j,k,iblk))
+
+                     else
+                        trcrn(i,j,nt_qice+k-1,n,iblk) = &
+                             -(rhoi * (cp_ice*(Tmltz(i,j,k,iblk)-Ti) &
+                             + Lfresh*(c1-Tmltz(i,j,k,iblk)/Ti) -    &
+                             cp_ocn*Tmltz(i,j,k,iblk)))
+                     endif ! ktherm
+                  enddo !k
+               enddo    ! do n=1,ncat
+            endif    ! if tmask
+         enddo    ! i
+         enddo    ! j
+ 
+      enddo       ! iblk
+      !$OMP END PARALLEL DO
+
+      endif
+      !$OMP PARALLEL DO PRIVATE(iblk)
+      do iblk = 1, nblocks
+
+         call aggregate (nx_block, ny_block, &
+                         aicen(:,:,:,iblk),  &
+                         trcrn(:,:,:,:,iblk),&
+                         vicen(:,:,:,iblk),  &
+                         vsnon(:,:,:,iblk),  &
+                         aice (:,:,  iblk),  &
+                         trcr (:,:,:,iblk),  &
+                         vice (:,:,  iblk),  &
+                         vsno (:,:,  iblk),  &
+                         aice0(:,:,  iblk),  &
+                         tmask(:,:,  iblk),  &
+                         max_ntrcr,          &
+                         trcr_depend)
+
+         aice_init(:,:,iblk) = aice(:,:,iblk)
+
+      enddo
+      !$OMP END PARALLEL DO
       end subroutine restartfile
 
 !=======================================================================
